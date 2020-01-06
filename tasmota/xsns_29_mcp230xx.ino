@@ -67,6 +67,8 @@ const char MCP230XX_INTCFG_RESPONSE[] PROGMEM = "{\"MCP230xx_INT%s\":{\"D_%i\":%
 const char MCP230XX_CMND_RESPONSE[] PROGMEM = "{\"S29cmnd_D%i\":{\"COMMAND\":\"%s\",\"STATE\":\"%s\"}}";
 #endif // USE_MCP230xx_OUTPUT
 
+uint8_t mcp230xx_last_portdata[2] = {0, 0};
+
 void MCP230xx_CheckForIntCounter(void) {
   uint8_t en = 0;
   for (uint32_t ca=0;ca<16;ca++) {
@@ -136,8 +138,17 @@ const char* IntModeTxt(uint8_t intmo) {
   return "";
 }
 
+// read's GPIO via interrupt if possible
 uint8_t MCP230xx_readGPIO(uint8_t port) {
-  return I2cRead8(USE_MCP230xx_ADDR, MCP230xx_GPIO + port);
+  // We need to process interrupt as reading GPIO will clear it
+  // Only check for interrupts if its enabled on one of the pins
+  if (mcp230xx_int_en) {
+    return MCP230xx_CheckForInterrupt(port, /*forceProcess =*/ true);
+  }
+  else {
+    mcp230xx_last_portdata[port] = I2cRead8(USE_MCP230xx_ADDR, MCP230xx_GPIO + port);
+    return mcp230xx_last_portdata[port];
+  }
 }
 
 void MCP230xx_ApplySettings(void)
@@ -232,94 +243,195 @@ void MCP230xx_Detect(void)
   }
 }
 
-void MCP230xx_CheckForInterrupt(void) {
-  uint8_t intf;
-  uint8_t mcp230xx_intcap = 0;
-  uint8_t report_int;
-  for (uint32_t mcp230xx_port = 0; mcp230xx_port < mcp230xx_type; mcp230xx_port++) {
-    if (I2cValidRead8(&intf,USE_MCP230xx_ADDR,MCP230xx_INTF+mcp230xx_port)) {
-      if (intf > 0) {
-        if (I2cValidRead8(&mcp230xx_intcap, USE_MCP230xx_ADDR, MCP230xx_INTCAP+mcp230xx_port)) {
-          for (uint32_t intp = 0; intp < 8; intp++) {
-            if ((intf >> intp) & 0x01) { // we know which pin caused interrupt
-              report_int = 0;
-              if (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].pinmode > 1) {
-                switch (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].pinmode) {
+uint8_t MCP230xx_CheckForInterrupt(uint8_t port, bool forceProcess) {
+  uint8_t intf = 0;
+  uint8_t portdata = 0;
+  bool report_int;
+  bool changed;
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+  bool report_toggle_int;
+  bool toggled;
+#endif // USE_MCP230xx_DETECT_TOGGLE
+  if (I2cValidRead8(&intf,USE_MCP230xx_ADDR,MCP230xx_INTF+port)) {
+    // if we have an interrupt, process it. If we don't and want the result, process anyway
+    if (intf > 0 || forceProcess) {
+      if (I2cValidRead8(&portdata, USE_MCP230xx_ADDR, MCP230xx_GPIO + port)) {
+        for (uint32_t intp = 0; intp < 8; intp++) {
+          // if the port data is the same as before but we got an interrupt, we must have transitioned back
+          // this will catch most cases where the transition occurs before we had a chance to read it but may
+          // miss cases where the interrupt happens after we read INTF but before we read GPIO
+          changed = (((portdata >> intp) & 0x01) != ((mcp230xx_last_portdata[port] >> intp) & 0x01));
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+          toggled = ((intf >> intp) & 0x01) && !changed;
+#endif // USE_MCP230xx_DETECT_TOGGLE
+          if ( changed
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+            || toggled
+#endif // USE_MCP230xx_DETECT_TOGGLE
+            ) {
+            report_int = false;
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+            report_toggle_int = false;
+#endif // USE_MCP230xx_DETECT_TOGGLE
+            if (Settings.mcp230xx_config[intp+(port*8)].pinmode > 1) {
+              switch (Settings.mcp230xx_config[intp+(port*8)].pinmode) {
+                case 2:
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+                  report_toggle_int = toggled;
+                  report_int = report_toggle_int || changed;
+#else
+                  report_int = changed;
+#endif
+                  break;
+                case 3:
+                  if (((portdata >> intp) & 0x01) == 0) 
+                  {
+                    report_int = changed; // Int on LOW
+                  }
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+                  else if (toggled)
+                  {
+                    report_toggle_int = true; // current HIGH, last seen HIGH, so Int on LOW
+                  }
+#endif // USE_MCP230xx_DETECT_TOGGLE
+                  break;
+                case 4:
+                  if (((portdata >> intp) & 0x01) == 1) 
+                  {
+                    report_int = changed; // Int on HIGH
+                  }
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+                  else if (toggled)
+                  {
+                    report_toggle_int = true; // current LOW, last seen LOW, so Int on HIGH
+                  }
+#endif // USE_MCP230xx_DETECT_TOGGLE
+                  break;
+                default:
+                  break;
+              }
+#ifdef USE_MCP230xx_DETECT_TOGGLE
+              if (mcp230xx_int_counter_en && report_toggle_int) { // We may have some counting to do
+                if (Settings.mcp230xx_config[intp+(port*8)].int_count_en) { // Indeed, for this pin
+                  mcp230xx_int_counter[intp+(port*8)]++;
+                }
+              }
+              if (report_toggle_int) {
+                if (Settings.mcp230xx_config[intp+(port*8)].int_report_defer) {
+                  mcp230xx_int_report_defer_counter[intp+(port*8)]++;
+                  if (mcp230xx_int_report_defer_counter[intp+(port*8)] >= Settings.mcp230xx_config[intp+(port*8)].int_report_defer) {
+                    mcp230xx_int_report_defer_counter[intp+(port*8)]=0;
+                  } else {
+                    report_toggle_int = false; // defer int report for now
+                  }
+                }
+              }
+              // check if interrupt retain is used, if it is for this pin then we do not report immediately as it will be reported in teleperiod
+              if (report_toggle_int) {
+                if (Settings.mcp230xx_config[intp+(port*8)].int_retain_flag) {
+                  mcp230xx_int_retainer[intp+(port*8)] = 1;
+                  report_toggle_int = false;
+                }
+              }
+              if (Settings.mcp230xx_config[intp+(port*8)].int_count_en) { // We do not want to report via tele or event if counting is enabled
+                report_toggle_int = false;
+              }
+              if (report_toggle_int) {
+                uint8_t toggle_portdata = ((portdata >> intp) & 0x01) == 0x00 ? 0x01 : 0x00;
+                bool int_tele = false;
+                bool int_event = false;
+                unsigned long millis_now = millis();
+                unsigned long millis_since_last_int = millis_now - int_millis[intp+(port*8)];
+                int_millis[intp+(port*8)]=millis_now;
+                switch (Settings.mcp230xx_config[intp+(port*8)].int_report_mode) {
+                  case 0:
+                    int_tele=true;
+                    int_event=true;
+                    break;
+                  case 1:
+                    int_event=true;
+                    break;
                   case 2:
-                    report_int = 1;
-                    break;
-                  case 3:
-                    if (((mcp230xx_intcap >> intp) & 0x01) == 0) report_int = 1; // Int on LOW
-                    break;
-                  case 4:
-                    if (((mcp230xx_intcap >> intp) & 0x01) == 1) report_int = 1; // Int on HIGH
-                    break;
-                  default:
+                    int_tele=true;
                     break;
                 }
-                // Check for interrupt counter
-                if ((mcp230xx_int_counter_en) && (report_int)) { // We may have some counting to do
-                  if (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_count_en) { // Indeed, for this pin
-                    mcp230xx_int_counter[intp+(mcp230xx_port*8)]++;
+                if (int_tele) {
+                  ResponseTime_P(PSTR(",\"MCP230XX_INT\":{\"D%i\":%i,\"MS\":%lu}}"),
+                    intp+(port*8), toggle_portdata, millis_since_last_int);
+                  MqttPublishPrefixTopic_P(RESULT_OR_STAT, PSTR("MCP230XX_INT"));
+                }
+                if (int_event) {
+                  char command[19]; // Theoretical max = 'event MCPINT_D16=1' so 18 + 1 (for the \n)
+                  sprintf(command,"event MCPINT_D%i=%i",intp+(port*8), toggle_portdata);
+                  ExecuteCommand(command, SRC_RULE);
+                }
+              }
+#endif // USE_MCP230xx_DETECT_TOGGLE
+              // Check for interrupt counter
+              if (mcp230xx_int_counter_en && report_int) { // We may have some counting to do
+                if (Settings.mcp230xx_config[intp+(port*8)].int_count_en) { // Indeed, for this pin
+                  mcp230xx_int_counter[intp+(port*8)]++;
+                }
+              }
+              // check for interrupt defer on this pin
+              if (report_int) {
+                if (Settings.mcp230xx_config[intp+(port*8)].int_report_defer) {
+                  mcp230xx_int_report_defer_counter[intp+(port*8)]++;
+                  if (mcp230xx_int_report_defer_counter[intp+(port*8)] >= Settings.mcp230xx_config[intp+(port*8)].int_report_defer) {
+                    mcp230xx_int_report_defer_counter[intp+(port*8)]=0;
+                  } else {
+                    report_int = false; // defer int report for now
                   }
                 }
-                // check for interrupt defer on this pin
-                if (report_int) {
-                  if (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_report_defer) {
-                    mcp230xx_int_report_defer_counter[intp+(mcp230xx_port*8)]++;
-                    if (mcp230xx_int_report_defer_counter[intp+(mcp230xx_port*8)] >= Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_report_defer) {
-                      mcp230xx_int_report_defer_counter[intp+(mcp230xx_port*8)]=0;
-                    } else {
-                      report_int = 0; // defer int report for now
-                    }
-                  }
+              }
+              // check if interrupt retain is used, if it is for this pin then we do not report immediately as it will be reported in teleperiod
+              if (report_int) {
+                if (Settings.mcp230xx_config[intp+(port*8)].int_retain_flag) {
+                  mcp230xx_int_retainer[intp+(port*8)] = 1;
+                  report_int = false; // do not report for now
                 }
-                // check if interrupt retain is used, if it is for this pin then we do not report immediately as it will be reported in teleperiod
-                if (report_int) {
-                  if (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_retain_flag) {
-                    mcp230xx_int_retainer[intp+(mcp230xx_port*8)] = 1;
-                    report_int = 0; // do not report for now
-                  }
+              }
+              if (Settings.mcp230xx_config[intp+(port*8)].int_count_en) { // We do not want to report via tele or event if counting is enabled
+                report_int = false;
+              }
+              if (report_int) {
+                bool int_tele = false;
+                bool int_event = false;
+                unsigned long millis_now = millis();
+                unsigned long millis_since_last_int = millis_now - int_millis[intp+(port*8)];
+                int_millis[intp+(port*8)]=millis_now;
+                switch (Settings.mcp230xx_config[intp+(port*8)].int_report_mode) {
+                  case 0:
+                    int_tele=true;
+                    int_event=true;
+                    break;
+                  case 1:
+                    int_event=true;
+                    break;
+                  case 2:
+                    int_tele=true;
+                    break;
                 }
-                if (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_count_en) { // We do not want to report via tele or event if counting is enabled
-                  report_int = 0;
+                if (int_tele) {
+                  ResponseTime_P(PSTR(",\"MCP230XX_INT\":{\"D%i\":%i,\"MS\":%lu}}"),
+                    intp+(port*8), ((portdata >> intp) & 0x01),millis_since_last_int);
+                  MqttPublishPrefixTopic_P(RESULT_OR_STAT, PSTR("MCP230XX_INT"));
                 }
-                if (report_int) {
-                  bool int_tele = false;
-                  bool int_event = false;
-                  unsigned long millis_now = millis();
-                  unsigned long millis_since_last_int = millis_now - int_millis[intp+(mcp230xx_port*8)];
-                  int_millis[intp+(mcp230xx_port*8)]=millis_now;
-                  switch (Settings.mcp230xx_config[intp+(mcp230xx_port*8)].int_report_mode) {
-                    case 0:
-                      int_tele=true;
-                      int_event=true;
-                      break;
-                    case 1:
-                      int_event=true;
-                      break;
-                    case 2:
-                      int_tele=true;
-                      break;
-                  }
-                  if (int_tele) {
-                    ResponseTime_P(PSTR(",\"MCP230XX_INT\":{\"D%i\":%i,\"MS\":%lu}}"),
-                      intp+(mcp230xx_port*8), ((mcp230xx_intcap >> intp) & 0x01),millis_since_last_int);
-                    MqttPublishPrefixTopic_P(RESULT_OR_STAT, PSTR("MCP230XX_INT"));
-                  }
-                  if (int_event) {
-                    char command[19]; // Theoretical max = 'event MCPINT_D16=1' so 18 + 1 (for the \n)
-                    sprintf(command,"event MCPINT_D%i=%i",intp+(mcp230xx_port*8),((mcp230xx_intcap >> intp) & 0x01));
-                    ExecuteCommand(command, SRC_RULE);
-                  }
+                if (int_event) {
+                  char command[19]; // Theoretical max = 'event MCPINT_D16=1' so 18 + 1 (for the \n)
+                  sprintf(command,"event MCPINT_D%i=%i",intp+(port*8),((portdata >> intp) & 0x01));
+                  ExecuteCommand(command, SRC_RULE);
                 }
               }
             }
           }
         }
+        mcp230xx_last_portdata[port] = portdata;
       }
     }
   }
+
+  return portdata;
 }
 
 void MCP230xx_Show(bool json)
@@ -787,7 +899,9 @@ bool Xsns29(uint8_t function)
         if (mcp230xx_int_en) { // Only check for interrupts if its enabled on one of the pins
           mcp230xx_int_prio_counter++;
           if ((mcp230xx_int_prio_counter) >= (Settings.mcp230xx_int_prio)) {
-            MCP230xx_CheckForInterrupt();
+            for (uint32_t mcp230xx_port = 0; mcp230xx_port < mcp230xx_type; mcp230xx_port++) {
+              MCP230xx_CheckForInterrupt(mcp230xx_port, /*forceProcess =*/ false);
+            }
             mcp230xx_int_prio_counter=0;
           }
         }
