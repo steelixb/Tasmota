@@ -4082,9 +4082,20 @@ void execute_script(char *script) {
 #define D_CMND_SCRIPT "Script"
 #define D_CMND_SUBSCRIBE "Subscribe"
 #define D_CMND_UNSUBSCRIBE "Unsubscribe"
+#ifdef USE_SCRIPT_NAMED_EVENTS
+#define D_CMND_EVENT "Event"
+#endif //USE_SCRIPT_NAMED_EVENTS
 
-enum ScriptCommands { CMND_SCRIPT,CMND_SUBSCRIBE, CMND_UNSUBSCRIBE };
-const char kScriptCommands[] PROGMEM = D_CMND_SCRIPT "|" D_CMND_SUBSCRIBE "|" D_CMND_UNSUBSCRIBE;
+enum ScriptCommands { CMND_SCRIPT,CMND_SUBSCRIBE, CMND_UNSUBSCRIBE
+#ifdef USE_SCRIPT_NAMED_EVENTS
+, CMND_EVENT 
+#endif //USE_SCRIPT_NAMED_EVENTS
+};
+const char kScriptCommands[] PROGMEM = D_CMND_SCRIPT "|" D_CMND_SUBSCRIBE "|" D_CMND_UNSUBSCRIBE 
+#ifdef USE_SCRIPT_NAMED_EVENTS
+"|" D_CMND_EVENT
+#endif //USE_SCRIPT_NAMED_EVENTS
+;
 
 bool ScriptCommand(void) {
   char command[CMDSZ];
@@ -4136,6 +4147,53 @@ bool ScriptCommand(void) {
       String result = ScriptUnsubscribe(XdrvMailbox.data, XdrvMailbox.data_len);
       Response_P(S_JSON_COMMAND_SVALUE, command, result.c_str());
 #endif        //SUPPORT_MQTT_EVENT
+#ifdef USE_SCRIPT_NAMED_EVENTS
+  } else if (CMND_EVENT == command_code) {
+      char *event;
+      char *parameter;
+      event = strtok_r(XdrvMailbox.data, "=", &parameter);
+      if (event) {
+        event = Trim(event);
+        if (parameter) {
+          parameter = Trim(parameter);
+        } 
+        else {
+          parameter = event + strlen(event);  // '\0'
+        }
+
+        char cmdbuff[128];
+        char *cp=cmdbuff;
+        strcpy_P(cp, PSTR("#E_"));
+        cp += 3;
+        uint8_t elen = strlen(event);
+        strncpy(cp, event, elen);
+        cp += elen;
+        elen += 3; // #E_
+        uint8_t plen = strlen(parameter);
+        if (plen > 0)
+        {
+          *cp++ = '(';
+          strncpy(cp, parameter, plen);
+          cp += plen;
+          *cp++ = ')';
+        }
+        *cp = '\0';
+        //toLog(cmdbuff);
+        uint32_t res = Run_Scripter(cmdbuff, elen, 0);
+        if (res) 
+        {
+          snprintf_P(mqtt_data, sizeof(mqtt_data), PSTR("{\"Event\":{ \"%s\":\"%s\",\"Result\":\"%d\"}}"), event, parameter, res);
+        }
+        else 
+        {
+          strcpy_P(mqtt_data, PSTR("{\"Event\":\"Done\"}"));
+        }
+      }
+      else
+      {
+        return false;
+      }
+#endif //USE_SCRIPT_NAMED_EVENTS
   }
   return serviced;
 }
